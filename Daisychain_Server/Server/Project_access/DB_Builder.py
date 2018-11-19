@@ -31,6 +31,8 @@ class DBBuilder:
         # Build the neo4j-based project database from the previously added files
         elif user_request[0] == "DB" and len(user_request) == 2 and user_request[1].isdigit():
             self.build_db(user_request[1])
+        elif user_request[0] == "LS" and len(user_request) == 2 and user_request[1].isdigit():
+            self.calculate_synteny(user_request[1])
         else:
             self.send_data("-3")
 
@@ -341,6 +343,228 @@ class DBBuilder:
         self.task_mngr.set_task_status(proj_id, task_id, "Finished")
         print("Finished")
 
+
+    # For every homolog relation, calculate the local synteny
+    # Determine how many homolog relations between gene neighbors of the homologs exist
+    # Calculate a score from it
+    # Approach: Retrieve every homolog relation, separated by cluster size
+    # Also retrieve a list of every gene-ID
+    # For every gene-ID, retrieve its neighbours
+
+    def calculate_synteny(self, proj_id):
+        self.send_data("Calculating local synteny")
+        task_id = self.task_mngr.define_task(proj_id, "Calculating local synteny")
+        bolt_port = self.main_db_conn.run("MATCH(proj:Project) WHERE ID(proj)={proj_id} "
+                                          "RETURN proj.bolt_port", {"proj_id": int(proj_id)}).single()[0]
+        # Read password from project folder
+        with open(os.path.join("Projects", str(proj_id), "access"), "r") as file:
+            neo4j_pw = file.read()
+        # Connect to the project DB
+        project_db_driver = GraphDatabase.driver("bolt://localhost:" + str(bolt_port),
+                                                 auth=basic_auth("neo4j", neo4j_pw), encrypted=False)
+        project_db_conn = project_db_driver.session()
+        self.task_mngr.set_task_status(proj_id, task_id, "Retrieving all homology relations for large clusters")
+        relations_14 = project_db_conn.run("MATCH(geneA:Gene)-[rel:HOMOLOG]->(geneB:Gene) WHERE rel.clstr_sens = '1.4' "
+                                           "RETURN startNode(rel).geneId AS start, endNode(rel).geneId AS end")
+        self.task_mngr.set_task_status(proj_id, task_id, "Retrieving all homology relations for medium clusters")
+        relations_50 = project_db_conn.run("MATCH(geneA:Gene)-[rel:HOMOLOG]->(geneB:Gene) WHERE rel.clstr_sens = '5.0' "
+                                           "RETURN startNode(rel).geneId AS start, endNode(rel).geneId AS end")
+        self.task_mngr.set_task_status(proj_id, task_id, "Retrieving all homology relations for small clusters")
+        relations_100 = project_db_conn.run("MATCH(geneA:Gene)-[rel:HOMOLOG]->(geneB:Gene) WHERE rel.clstr_sens='10.0' "
+                                           "RETURN startNode(rel).geneId AS start, endNode(rel).geneId AS end")
+
+        self.task_mngr.set_task_status(proj_id, task_id, "Converting homology edges")
+        # Convert each relation edge into a dict. Key is start ID, value is a list of end IDs
+        # Also store every hmlg edge as a list of (start, end) tuples
+        rel_14_dict = {}
+        rel_14_list = []
+        for rel in relations_14:
+            start_node = rel["start"]
+            end_node = rel["end"]
+            # Do not calculate synteny score for self/self-loops
+            if start_node == end_node: continue
+            try:
+                rel_14_dict[start_node].append(end_node)
+            except KeyError:
+                rel_14_dict[start_node]= [end_node]
+            rel_14_list.append((start_node, end_node))
+        rel_50_dict = {}
+        rel_50_list = []
+        for rel in relations_50:
+            start_node = rel["start"]
+            end_node = rel["end"]
+            # Do not calculate synteny score for self/self-loops
+            if start_node == end_node: continue
+            try:
+                rel_50_dict[start_node].append(end_node)
+            except KeyError:
+                rel_50_dict[start_node] = [end_node]
+            rel_50_list.append((start_node, end_node))
+        rel_100_dict = {}
+        rel_100_list = []
+        for rel in relations_100:
+            start_node = rel["start"]
+            end_node = rel["end"]
+            # Do not calculate synteny score for self/self-loops
+            if start_node == end_node: continue
+            try:
+                rel_100_dict[start_node].append(end_node)
+            except KeyError:
+                rel_100_dict[start_node] = [end_node]
+            rel_100_list.append((start_node, end_node))
+
+
+        # Loop through every relation
+        # For each start and end node, retrieve the neighboring genes
+        # Then test for homology relations between the two sets of neighboring genes
+        # Start with homoogy relations where inflation value = 1.4 (large cluster)
+        nr_of_rel = len(rel_14_list)+len(rel_50_list)+len(rel_100_list)
+        self.task_mngr.set_task_status(proj_id, task_id, "Calculating local synteny 0% completed")
+        finished_rel_counter = 0
+        for rel in rel_14_list:
+            if finished_rel_counter % 5000 == 0:
+                self.task_mngr.set_task_status(proj_id, task_id, str(round(100 * finished_rel_counter / nr_of_rel, 2)) +
+                                               "% completed")
+            start_node = rel[0]
+            end_node = rel[1]
+            # First get all gene neighbors for start node
+            gene5nb = project_db_conn.run("MATCH(gene:Gene)-[:`5_NB`*1..5]->(gene5NB:Gene) WHERE gene.geneId = {geneID}"
+                                          " RETURN COLLECT(gene5NB.geneId) as IDs",
+                                          {"geneID":start_node}).single()["IDs"]
+            gene3nb = project_db_conn.run("MATCH(gene:Gene)-[:`3_NB`*1..5]->(gene3NB:Gene) WHERE gene.geneId = {geneID}"
+                                          " RETURN COLLECT(gene3NB.geneId) as IDs",
+                                          {"geneID":start_node}).single()["IDs"]
+            start_node_nb = gene5nb+gene3nb
+            # Then get all gene neighbors for end node
+            gene5nb = project_db_conn.run("MATCH(gene:Gene)-[:`5_NB`*1..5]->(gene5NB:Gene) WHERE gene.geneId = {geneID}"
+                                          " RETURN COLLECT(gene5NB.geneId) as IDs", {"geneID": end_node}).single()[
+                "IDs"]
+            gene3nb = project_db_conn.run("MATCH(gene:Gene)-[:`3_NB`*1..5]->(gene3NB:Gene) WHERE gene.geneId = {geneID}"
+                                          " RETURN COLLECT(gene3NB.geneId) as IDs", {"geneID": end_node}).single()[
+                "IDs"]
+            end_node_nb = gene5nb + gene3nb
+            # Create all possible combinations between the two sets of gene neighbor nodes
+            potential_hmlg_relations = list(product(start_node_nb, end_node_nb))
+            # Check for hmlg relations
+            # Keep count of found hmlg relations
+            score = 0
+            # Also keep track of the starting and end nodes of found hmlg relations
+            # Each node of the start_node_nb or end_node_nb set can only be involved in one hmlg relation
+            # This is done to prevent misleading high score counts in case a gene has multiple homology relations
+            # with neighboring genes
+            hmlg_rel_start_nodes = []
+            for pot_hmlg_rel in potential_hmlg_relations:
+                if pot_hmlg_rel[0] in hmlg_rel_start_nodes or pot_hmlg_rel[1] in hmlg_rel_start_nodes:
+                    continue
+                try:
+                    if pot_hmlg_rel[1] in rel_14_dict[pot_hmlg_rel[0]]:
+                        score += 1
+                        hmlg_rel_start_nodes.append(pot_hmlg_rel[0])
+                        hmlg_rel_start_nodes.append(pot_hmlg_rel[1])
+                except KeyError:
+                    continue
+            project_db_conn.run("MATCH(geneStart:Gene)-[rel:HOMOLOG]->(geneEnd:Gene) "
+                                "WHERE geneStart.geneId = {startID} AND geneEnd.geneId = {endID} "
+                                "AND rel.clstr_sens = '1.4' SET rel.ls_score = {score}",
+                                {"startID":start_node,"endID":end_node, "score": str(score)})
+            finished_rel_counter+=1
+
+        for rel in rel_50_list:
+            if finished_rel_counter % 5000 == 0:
+                self.task_mngr.set_task_status(proj_id, task_id, str(round(100 * finished_rel_counter / nr_of_rel, 2)) +
+                                               "% completed")
+            start_node = rel[0]
+            end_node = rel[1]
+            # First get all gene neighbors for start node
+            gene5nb = project_db_conn.run("MATCH(gene:Gene)-[:`5_NB`*1..5]->(gene5NB:Gene) WHERE gene.geneId = {geneID}"
+                                          " RETURN COLLECT(gene5NB.geneId) as IDs",
+                                          {"geneID": start_node}).single()["IDs"]
+            gene3nb = project_db_conn.run("MATCH(gene:Gene)-[:`3_NB`*1..5]->(gene3NB:Gene) WHERE gene.geneId = {geneID}"
+                                          " RETURN COLLECT(gene3NB.geneId) as IDs",
+                                          {"geneID": start_node}).single()["IDs"]
+            start_node_nb = gene5nb + gene3nb
+            # Then get all gene neighbors for end node
+            gene5nb = project_db_conn.run("MATCH(gene:Gene)-[:`5_NB`*1..5]->(gene5NB:Gene) WHERE gene.geneId = {geneID}"
+                                          " RETURN COLLECT(gene5NB.geneId) as IDs", {"geneID": end_node}).single()[
+                "IDs"]
+            gene3nb = project_db_conn.run("MATCH(gene:Gene)-[:`3_NB`*1..5]->(gene3NB:Gene) WHERE gene.geneId = {geneID}"
+                                          " RETURN COLLECT(gene3NB.geneId) as IDs", {"geneID": end_node}).single()[
+                "IDs"]
+            end_node_nb = gene5nb + gene3nb
+            # Create all possible combinations between the two sets of gene neighbor nodes
+            potential_hmlg_relations = list(product(start_node_nb, end_node_nb))
+            # Check for hmlg relations
+            # Keep count of found hmlg relations
+            score = 0
+            # Also keep track of the starting and end nodes of found hmlg relations
+            # Each node of the start_node_nb or end_node_nb set can only be involved in one hmlg relation
+            # This is done to prevent misleading high score counts in case a gene has multiple homology relations
+            # with neighboring genes
+            hmlg_rel_start_nodes = []
+            for pot_hmlg_rel in potential_hmlg_relations:
+                if pot_hmlg_rel[0] in hmlg_rel_start_nodes or pot_hmlg_rel[1] in hmlg_rel_start_nodes:
+                    continue
+                try:
+                    if pot_hmlg_rel[1] in rel_14_dict[pot_hmlg_rel[0]]:
+                        score += 1
+                        hmlg_rel_start_nodes.append(pot_hmlg_rel[0])
+                        hmlg_rel_start_nodes.append(pot_hmlg_rel[1])
+                except KeyError:
+                    continue
+            project_db_conn.run("MATCH(geneStart:Gene)-[rel:HOMOLOG]->(geneEnd:Gene) "
+                                "WHERE geneStart.geneId = {startID} AND geneEnd.geneId = {endID} "
+                                "AND rel.clstr_sens = '5.0' SET rel.ls_score = {score}",
+                                {"startID": start_node, "endID": end_node, "score": str(score)})
+            finished_rel_counter += 1
+
+        for rel in rel_100_list:
+            if finished_rel_counter % 5000 == 0:
+                self.task_mngr.set_task_status(proj_id, task_id, str(round(100*finished_rel_counter/nr_of_rel, 2))+
+                                               "% completed")
+            start_node = rel[0]
+            end_node = rel[1]
+            # First get all gene neighbors for start node
+            gene5nb = project_db_conn.run("MATCH(gene:Gene)-[:`5_NB`*1..5]->(gene5NB:Gene) WHERE gene.geneId = {geneID}"
+                                          " RETURN COLLECT(gene5NB.geneId) as IDs",
+                                          {"geneID": start_node}).single()["IDs"]
+            gene3nb = project_db_conn.run("MATCH(gene:Gene)-[:`3_NB`*1..5]->(gene3NB:Gene) WHERE gene.geneId = {geneID}"
+                                          " RETURN COLLECT(gene3NB.geneId) as IDs",
+                                          {"geneID": start_node}).single()["IDs"]
+            start_node_nb = gene5nb + gene3nb
+            # Then get all gene neighbors for end node
+            gene5nb = project_db_conn.run("MATCH(gene:Gene)-[:`5_NB`*1..5]->(gene5NB:Gene) WHERE gene.geneId = {geneID}"
+                                          " RETURN COLLECT(gene5NB.geneId) as IDs", {"geneID": end_node}).single()[
+                "IDs"]
+            gene3nb = project_db_conn.run("MATCH(gene:Gene)-[:`3_NB`*1..5]->(gene3NB:Gene) WHERE gene.geneId = {geneID}"
+                                          " RETURN COLLECT(gene3NB.geneId) as IDs", {"geneID": end_node}).single()[
+                "IDs"]
+            end_node_nb = gene5nb + gene3nb
+            # Create all possible combinations between the two sets of gene neighbor nodes
+            potential_hmlg_relations = list(product(start_node_nb, end_node_nb))
+            # Check for hmlg relations
+            # Keep count of found hmlg relations
+            score = 0
+            # Also keep track of the starting and end nodes of found hmlg relations
+            # Each node of the start_node_nb or end_node_nb set can only be involved in one hmlg relation
+            # This is done to prevent misleading high score counts in case a gene has multiple homology relations
+            # with neighboring genes
+            hmlg_rel_start_nodes = []
+            for pot_hmlg_rel in potential_hmlg_relations:
+                if pot_hmlg_rel[0] in hmlg_rel_start_nodes or pot_hmlg_rel[1] in hmlg_rel_start_nodes:
+                    continue
+                try:
+                    if pot_hmlg_rel[1] in rel_14_dict[pot_hmlg_rel[0]]:
+                        score += 1
+                        hmlg_rel_start_nodes.append(pot_hmlg_rel[0])
+                        hmlg_rel_start_nodes.append(pot_hmlg_rel[1])
+                except KeyError:
+                    continue
+            project_db_conn.run("MATCH(geneStart:Gene)-[rel:HOMOLOG]->(geneEnd:Gene) "
+                                "WHERE geneStart.geneId = {startID} AND geneEnd.geneId = {endID} "
+                                "AND rel.clstr_sens = '10.0' SET rel.ls_score = {score}",
+                                {"startID": start_node, "endID": end_node, "score": str(score)})
+            finished_rel_counter += 1
+        self.task_mngr.set_task_status(proj_id, task_id, "Finished")
 
 
     # For one GFF3 file (or all GFF3 files) in a project, set the annotation mapper and the feature hierarchy
