@@ -3,7 +3,7 @@
 # Functions directly accessible by user query always return a string via socket connection
 import os
 import subprocess
-from itertools import islice
+from itertools import islice, product
 from CSV_creator.annotation_to_csv import AnnoToCSV
 from CSV_creator.cluster_to_csv import ClusterToCSV
 from Parser.GFF3_parser_gffutils_v2 import GFF3Parser_v2
